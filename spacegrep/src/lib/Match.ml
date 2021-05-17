@@ -40,6 +40,8 @@ open Pattern_AST
 
 let debug = ref false
 
+let phys_eq = ( == )
+
 (*** Public types ***)
 
 type pattern_id = int
@@ -462,8 +464,7 @@ let search ?(case_sensitive = true) src pat doc =
   |> List.filter (fun match_ ->
     match Hashtbl.find_opt end_loc_tbl (snd match_.region) with
     | None -> assert false
-    | Some selected_match -> (==) match_ selected_match
-  )
+    | Some selected_match -> phys_eq match_ selected_match)
 
 let timef f =
   let t1 = Unix.gettimeofday () in
@@ -517,7 +518,7 @@ let print_nested_results
     ?highlight
     ?(print_optional_separator = make_separator_printer ())
     doc_matches =
-  List.iter (fun (src, pat_matches) ->
+  List.iter (fun (src, pat_matches, _parse_time, _run_time) ->
     List.iter (fun (_pat_id, matches, _match_time) ->
       print ?highlight ~print_optional_separator src matches
     ) pat_matches

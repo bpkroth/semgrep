@@ -31,14 +31,13 @@ YML_TEST_SUFFIXES = [[".test", ext] for ext in YML_EXTENSIONS]
 class OutputFormat(Enum):
     TEXT = auto()
     JSON = auto()
-    JSON_DEBUG = auto()
     JUNIT_XML = auto()
     SARIF = auto()
     EMACS = auto()
     VIM = auto()
 
     def is_json(self) -> bool:
-        return self == OutputFormat.JSON or self == OutputFormat.JSON_DEBUG
+        return self in [OutputFormat.JSON, OutputFormat.SARIF]
 
 
 # Inline 'noqa' implementation modified from flake8:
@@ -71,3 +70,4 @@ BREAK_LINE = BREAK_LINE_CHAR * BREAK_LINE_WIDTH
 MAX_CHARS_FLAG_NAME = "--max-chars-per-line"
 DEFAULT_MAX_CHARS_PER_LINE = 160
 ELLIPSIS_STRING = " ... "
+DEFAULT_MAX_TARGET_SIZE = 1000000  # 1 MB

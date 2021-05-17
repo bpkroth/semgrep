@@ -1,11 +1,10 @@
 import contextlib
-import json
 import logging
+import pathlib
 import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
-from typing import cast
 from typing import Dict
 from typing import FrozenSet
 from typing import Generator
@@ -15,11 +14,10 @@ from typing import List
 from typing import NamedTuple
 from typing import Optional
 from typing import Set
-from typing import Tuple
+from typing import Type
 
 import colorama
 
-from semgrep import __VERSION__
 from semgrep import config_resolver
 from semgrep.constants import BREAK_LINE
 from semgrep.constants import BREAK_LINE_CHAR
@@ -33,9 +31,14 @@ from semgrep.error import FINDINGS_EXIT_CODE
 from semgrep.error import Level
 from semgrep.error import MatchTimeoutError
 from semgrep.error import SemgrepError
-from semgrep.external.junit_xml import TestSuite  # type: ignore[attr-defined]
-from semgrep.external.junit_xml import to_xml_report_string  # type: ignore[attr-defined]
+from semgrep.formatter.base import BaseFormatter
+from semgrep.formatter.emacs import EmacsFormatter
+from semgrep.formatter.json import JsonFormatter
+from semgrep.formatter.junit_xml import JunitXmlFormatter
+from semgrep.formatter.sarif import SarifFormatter
+from semgrep.formatter.vim import VimFormatter
 from semgrep.profile_manager import ProfileManager
+from semgrep.profiling import ProfilingData
 from semgrep.rule import Rule
 from semgrep.rule_match import RuleMatch
 from semgrep.stats import make_loc_stats
@@ -44,6 +47,15 @@ from semgrep.util import is_url
 from semgrep.util import with_color
 
 logger = logging.getLogger(__name__)
+
+
+def get_path_str(target: Path) -> str:
+    path_str = ""
+    try:
+        path_str = str(target.relative_to(pathlib.Path().absolute()))
+    except ValueError:
+        path_str = str(target)
+    return path_str
 
 
 def color_line(
@@ -132,11 +144,88 @@ def finding_to_line(
                 yield BREAK_LINE
 
 
+def format_bytes(num: float) -> str:
+    for unit in ["", "K", "M", "G", "T", "P", "E", "Z"]:
+        if abs(num) < 1024.0:
+            return "%3d%sB" % (num, unit)
+        num /= 1024.0
+    return "%.1f%sB" % (num, "Y")
+
+
+def truncate(file_name: str, col_lim: int) -> str:
+    name_len = len(file_name)
+    if name_len > col_lim:
+        file_name = "..." + file_name[name_len - col_lim + 3 :]
+    return file_name
+
+
+def build_timing_summary(
+    rules: List[Rule],
+    targets: Set[Path],
+    profiling_data: ProfilingData,
+    color_output: bool,
+) -> Iterator[str]:
+    items_to_show = 5
+    col_lim = 70
+    RESET_COLOR = colorama.Style.RESET_ALL if color_output else ""
+    GREEN_COLOR = colorama.Fore.GREEN if color_output else ""
+    YELLOW_COLOR = colorama.Fore.YELLOW if color_output else ""
+
+    rule_parsing_time = 0.0
+    file_parsing_time = 0.0
+    rule_timings = {}
+    file_timings: Dict[str, float] = {}
+    for rule in rules:
+        parse_time = profiling_data.get_parse_time(rule.id)
+        rule_timings[rule.id] = (parse_time, 0.0)
+        rule_parsing_time += parse_time
+        for target in targets:
+            path_str = get_path_str(target)
+            times = profiling_data.get_run_times(rule.id, path_str)
+            rule_timings[rule.id] = tuple(
+                x + y
+                for x, y in zip(
+                    rule_timings[rule.id],
+                    (times.run_time - times.parse_time, times.match_time),
+                )
+            )  # type: ignore
+            file_timings[path_str] = file_timings.get(path_str, 0.0) + times.run_time
+            file_parsing_time += times.parse_time
+    all_total_time = sum(i for i in file_timings.values()) + rule_parsing_time
+    total_matching_time = sum(i[1] for i in rule_timings.values())
+
+    # Output information
+    yield f"\nSemgrep-core timing summary:"
+    yield f"Total CPU time: {all_total_time:.4f}  File parse time: {file_parsing_time:.4f}" f"  Rule parse time: {rule_parsing_time:.4f}  Match time: {total_matching_time:.4f}"
+
+    yield f"Slowest {items_to_show}/{len(file_timings)} files"
+    slowest_file_times = sorted(file_timings.items(), key=lambda x: x[1], reverse=True)[
+        :items_to_show
+    ]
+    for file_name, parse_time in slowest_file_times:
+        num_bytes = f"({format_bytes(Path(file_name).resolve().stat().st_size)}):"
+        file_name = truncate(file_name, col_lim)
+        yield f"{GREEN_COLOR}{file_name:<70}{RESET_COLOR} {num_bytes:<9}{parse_time:.4f}"
+
+    yield f"Slowest {items_to_show} rules to run (excluding parse time)"
+    slowest_rule_times = sorted(
+        rule_timings.items(), key=lambda x: x[1][0], reverse=True
+    )[:items_to_show]
+    for rule_id, (total_time, match_time) in slowest_rule_times:
+        rule_id = truncate(rule_id, col_lim) + ":"
+        yield f"{YELLOW_COLOR}{rule_id:<71}{RESET_COLOR} run time {total_time:.4f}  match time {match_time:.4f}"
+
+
+# todo: use profiler for individual rule timings
 def build_normal_output(
     rule_matches: List[RuleMatch],
     color_output: bool,
     per_finding_max_lines_limit: Optional[int],
     per_line_max_chars_limit: Optional[int],
+    all_targets: Set[Path],
+    show_times: bool,
+    filtered_rules: List[Rule],
+    profiling_data: ProfilingData,
 ) -> Iterator[str]:
     RESET_COLOR = colorama.Style.RESET_ALL if color_output else ""
     GREEN_COLOR = colorama.Fore.GREEN if color_output else ""
@@ -182,6 +271,13 @@ def build_normal_output(
             if rule_index != len(sorted_rule_matches) - 1
             else None
         )
+
+        if fix:
+            yield f"{BLUE_COLOR}autofix:{RESET_COLOR} {fix}"
+        elif rule_match.fix_regex:
+            fix_regex = rule_match.fix_regex
+            yield f"{BLUE_COLOR}autofix:{RESET_COLOR} s/{fix_regex.get('regex')}/{fix_regex.get('replacement')}/{fix_regex.get('count', 'g')}"
+
         is_same_file = (
             next_rule_match.path == rule_match.path if next_rule_match else False
         )
@@ -192,32 +288,36 @@ def build_normal_output(
             per_line_max_chars_limit,
             is_same_file,
         )
-
-        if fix:
-            yield f"{BLUE_COLOR}autofix:{RESET_COLOR} {fix}"
-        elif rule_match.fix_regex:
-            fix_regex = rule_match.fix_regex
-            yield f"{BLUE_COLOR}autofix:{RESET_COLOR} s/{fix_regex.get('regex')}/{fix_regex.get('replacement')}/{fix_regex.get('count', 'g')}"
+    if show_times:
+        yield from build_timing_summary(
+            filtered_rules, all_targets, profiling_data, color_output
+        )
 
 
 def _build_time_target_json(
     rules: List[Rule],
     target: Path,
-    match_time_matrix: Dict[Tuple[str, str], float],
+    num_bytes: int,
+    profiling_data: ProfilingData,
 ) -> Dict[str, Any]:
     target_json: Dict[str, Any] = {}
-    path_str = str(target)
+    path_str = get_path_str(target)
+
     target_json["path"] = path_str
-    target_json["match_times"] = [
-        match_time_matrix.get((rule.id, path_str), 0.0) for rule in rules
-    ]
+    target_json["num_bytes"] = num_bytes
+    timings = [profiling_data.get_run_times(rule.id, path_str) for rule in rules]
+    target_json["parse_times"] = [timing.parse_time for timing in timings]
+    target_json["match_times"] = [timing.match_time for timing in timings]
+    target_json["run_times"] = [timing.run_time for timing in timings]
+
     return target_json
 
 
 def _build_time_json(
     rules: List[Rule],
     targets: Set[Path],
-    match_time_matrix: Dict[Tuple[str, str], float],  # (rule, target) -> duration
+    profiling_data: ProfilingData,  # (rule, target) -> times
+    total_time: float,
 ) -> Dict[str, Any]:
     """Convert match times to a json-ready format.
 
@@ -227,180 +327,37 @@ def _build_time_json(
     the target file will become negligible once we run many rules on the
     same AST.
     """
-    time = {}
+    time_info: Dict[str, Any] = {}
     # this list of all rules names is given here so they don't have to be
     # repeated for each target in the 'targets' field, saving space.
-    time["rules"] = [{"id": rule.id} for rule in rules]
-    time["targets"] = [
-        _build_time_target_json(rules, target, match_time_matrix) for target in targets
+    time_info["rules"] = [{"id": rule.id} for rule in rules]
+    time_info["rule_parse_info"] = [
+        profiling_data.get_parse_time(rule.id) for rule in rules
     ]
-    return time
+    time_info["total_time"] = total_time
+    target_bytes = [Path(str(target)).resolve().stat().st_size for target in targets]
+    time_info["targets"] = [
+        _build_time_target_json(rules, target, num_bytes, profiling_data)
+        for target, num_bytes in zip(targets, target_bytes)
+    ]
+    time_info["total_bytes"] = sum(n for n in target_bytes)
+    return time_info
 
 
-def build_output_json(
-    rule_matches: List[RuleMatch],
-    semgrep_structured_errors: List[SemgrepError],
-    all_targets: Set[Path],
-    show_json_stats: bool,
-    report_time: bool,
-    filtered_rules: List[Rule],
-    match_time_matrix: Dict[Tuple[str, str], float],
-    profiler: Optional[ProfileManager] = None,
-    debug_steps_by_rule: Optional[Dict[Rule, List[Dict[str, Any]]]] = None,
-) -> str:
-    output_json: Dict[str, Any] = {}
-    output_json["results"] = [rm.to_json() for rm in rule_matches]
-    if debug_steps_by_rule:
-        output_json["debug"] = [
-            {r.id: steps for r, steps in debug_steps_by_rule.items()}
-        ]
-    output_json["errors"] = [e.to_dict() for e in semgrep_structured_errors]
-    if show_json_stats:
-        output_json["stats"] = {
-            "targets": make_target_stats(all_targets),
-            "loc": make_loc_stats(all_targets),
-            "profiler": profiler.dump_stats() if profiler else None,
-        }
-    if report_time:
-        output_json["time"] = _build_time_json(
-            filtered_rules, all_targets, match_time_matrix
-        )
-    return json.dumps(output_json)
-
-
-def build_junit_xml_output(
-    rule_matches: List[RuleMatch], rules: FrozenSet[Rule]
-) -> str:
-    """
-    Format matches in JUnit XML format.
-    """
-    test_cases = [match.to_junit_xml() for match in rule_matches]
-    ts = TestSuite("semgrep results", test_cases)
-    return cast(str, to_xml_report_string([ts]))
-
-
-def _sarif_tool_info() -> Dict[str, Any]:
-    return {"name": "semgrep", "semanticVersion": __VERSION__}
-
-
-def _sarif_notification_from_error(error: SemgrepError) -> Dict[str, Any]:
-    error_dict = error.to_dict()
-    descriptor = error_dict["type"]
-
-    error_to_sarif_level = {
-        Level.ERROR.name.lower(): "error",
-        Level.WARN.name.lower(): "warning",
-    }
-    level = error_to_sarif_level[error_dict["level"]]
-
-    message = error_dict.get("message")
-    if message is None:
-        message = error_dict.get("long_msg")
-    if message is None:
-        message = error_dict.get("short_msg", "")
-
-    return {
-        "descriptor": {"id": descriptor},
-        "message": {"text": message},
-        "level": level,
-    }
-
-
-def build_sarif_output(
-    rule_matches: List[RuleMatch],
-    rules: FrozenSet[Rule],
-    semgrep_structured_errors: List[SemgrepError],
-) -> str:
-    """
-    Format matches in SARIF v2.1.0 formatted JSON.
-
-    - written based on https://help.github.com/en/github/finding-security-vulnerabilities-and-errors-in-your-code/about-sarif-support-for-code-scanning
-    - which links to this schema https://github.com/oasis-tcs/sarif-spec/blob/master/Schemata/sarif-schema-2.1.0.json
-    - full spec is at https://docs.oasis-open.org/sarif/sarif/v2.1.0/cs01/sarif-v2.1.0-cs01.html
-    """
-
-    output_dict = {
-        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [
-            {
-                "tool": {
-                    "driver": {
-                        **_sarif_tool_info(),
-                        "rules": [rule.to_sarif() for rule in rules],
-                    }
-                },
-                "results": [match.to_sarif() for match in rule_matches],
-                "invocations": [
-                    {
-                        "executionSuccessful": True,
-                        "toolExecutionNotifications": [
-                            _sarif_notification_from_error(e)
-                            for e in semgrep_structured_errors
-                        ],
-                    }
-                ],
-            },
-        ],
-    }
-    return json.dumps(output_dict)
-
-
-def iter_emacs_output(
-    rule_matches: List[RuleMatch], rules: FrozenSet[Rule]
-) -> Iterator[str]:
-    last_file = None
-    last_message = None
-    sorted_rule_matches = sorted(rule_matches, key=lambda r: (r.path, r.id))
-    for _, rule_match in enumerate(sorted_rule_matches):
-        current_file = rule_match.path
-        check_id = rule_match.id
-        message = rule_match.message
-        severity = rule_match.severity.lower()
-        start_line = rule_match.start.get("line")
-        start_col = rule_match.start.get("col")
-        line = rule_match.lines[0].rstrip()
-        info = ""
-        if check_id and check_id != CLI_RULE_ID:
-            check_id = check_id.split(".")[-1]
-            info = f"({check_id})"
-        yield f"{current_file}:{start_line}:{start_col}:{severity}{info}:{line}"
-
-
-def build_emacs_output(rule_matches: List[RuleMatch], rules: FrozenSet[Rule]) -> str:
-    return "\n".join(list(iter_emacs_output(rule_matches, rules)))
-
-
-def build_vim_output(rule_matches: List[RuleMatch], rules: FrozenSet[Rule]) -> str:
-    severity = {
-        "INFO": "I",
-        "WARNING": "W",
-        "ERROR": "E",
-    }
-
-    def _get_parts(rule_match: RuleMatch) -> List[str]:
-        return [
-            str(rule_match.path),
-            str(rule_match.start["line"]),
-            str(rule_match.start["col"]),
-            severity[rule_match.severity],
-            rule_match.id,
-            rule_match.message,
-        ]
-
-    return "\n".join(":".join(_get_parts(rm)) for rm in rule_matches)
-
-
+# WARNING: this class is unofficially part of our external API. It can be passed
+# as an argument to our official API: 'semgrep_main.invoke_semgrep'. Try to minimize
+# changes to this API, and make them backwards compatible, if possible.
 class OutputSettings(NamedTuple):
     output_format: OutputFormat
-    output_destination: Optional[str]
-    error_on_findings: bool
-    verbose_errors: bool
-    strict: bool
-    output_per_finding_max_lines_limit: Optional[int]
-    output_per_line_max_chars_limit: Optional[int]
-    json_stats: bool
-    json_time: bool
+    output_destination: Optional[str] = None
+    output_per_finding_max_lines_limit: Optional[int] = None
+    output_per_line_max_chars_limit: Optional[int] = None
+    error_on_findings: bool = False
+    verbose_errors: bool = False  # to do: rename to just 'verbose'
+    strict: bool = False
+    debug: bool = False
+    json_stats: bool = False
+    output_time: bool = False
     timeout_threshold: int = 0
 
 
@@ -452,9 +409,9 @@ class OutputHandler:
         self.error_set: Set[SemgrepError] = set()
         self.has_output = False
         self.filtered_rules: List[Rule] = []
-        self.match_time_matrix: Dict[
-            Tuple[str, str], float
-        ] = {}  # (rule, target) -> duration
+        self.profiling_data: ProfilingData = (
+            ProfilingData()
+        )  # (rule, target) -> duration
 
         self.final_error: Optional[Exception] = None
 
@@ -515,7 +472,7 @@ class OutputHandler:
         all_targets: Set[Path],
         profiler: ProfileManager,
         filtered_rules: List[Rule],
-        match_time_matrix: Dict[Tuple[str, str], float],  # (rule, target) -> duration
+        profiling_data: ProfilingData,  # (rule, target) -> duration
     ) -> None:
         self.has_output = True
         self.rules = self.rules.union(rule_matches_by_rule.keys())
@@ -529,7 +486,7 @@ class OutputHandler:
         self.stats_line = stats_line
         self.debug_steps_by_rule.update(debug_steps_by_rule)
         self.filtered_rules = filtered_rules
-        self.match_time_matrix = match_time_matrix
+        self.profiling_data = profiling_data
 
     def handle_unhandled_exception(self, ex: Exception) -> None:
         """
@@ -632,31 +589,38 @@ class OutputHandler:
         per_line_max_chars_limit: Optional[int],
     ) -> str:
         output_format = self.settings.output_format
-        debug_steps = None
-        if output_format == OutputFormat.JSON_DEBUG:
-            debug_steps = self.debug_steps_by_rule
-        if output_format.is_json():
-            return build_output_json(
-                self.rule_matches,
-                self.semgrep_structured_errors,
-                self.all_targets,
-                self.settings.json_stats,
-                self.settings.json_time,
-                self.filtered_rules,
-                self.match_time_matrix,
-                self.profiler,
-                debug_steps,
+
+        extra: Dict[str, Any] = {}
+        if self.settings.debug:
+            extra["debug"] = [
+                {rule.id: steps for rule, steps in self.debug_steps_by_rule.items()}
+            ]
+        if self.settings.json_stats:
+            extra["stats"] = {
+                "targets": make_target_stats(self.all_targets),
+                "loc": make_loc_stats(self.all_targets),
+                "profiler": self.profiler.dump_stats() if self.profiler else None,
+            }
+        if self.settings.output_time:
+            total_time = self.profiler.calls["total_time"][0] if self.profiler else -1.0
+            extra["time"] = _build_time_json(
+                self.filtered_rules, self.all_targets, self.profiling_data, total_time
             )
-        elif output_format == OutputFormat.JUNIT_XML:
-            return build_junit_xml_output(self.rule_matches, self.rules)
-        elif output_format == OutputFormat.SARIF:
-            return build_sarif_output(
-                self.rule_matches, self.rules, self.semgrep_structured_errors
+
+        structured_formatters: Dict[OutputFormat, Type[BaseFormatter]] = {
+            OutputFormat.EMACS: EmacsFormatter,
+            OutputFormat.JSON: JsonFormatter,
+            OutputFormat.JUNIT_XML: JunitXmlFormatter,
+            OutputFormat.SARIF: SarifFormatter,
+            OutputFormat.VIM: VimFormatter,
+        }
+        formatter_type = structured_formatters.get(output_format)
+
+        if formatter_type is not None:
+            formatter = formatter_type(
+                self.rules, self.rule_matches, self.semgrep_structured_errors, extra
             )
-        elif output_format == OutputFormat.EMACS:
-            return build_emacs_output(self.rule_matches, self.rules)
-        elif output_format == OutputFormat.VIM:
-            return build_vim_output(self.rule_matches, self.rules)
+            return formatter.output()
         elif output_format == OutputFormat.TEXT:
             return "\n".join(
                 list(
@@ -665,6 +629,10 @@ class OutputHandler:
                         color_output,
                         per_finding_max_lines_limit,
                         per_line_max_chars_limit,
+                        self.all_targets,
+                        self.settings.output_time,
+                        self.filtered_rules,
+                        self.profiling_data,
                     )
                 )
             )

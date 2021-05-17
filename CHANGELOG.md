@@ -2,10 +2,67 @@
 
 This project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
-## Coming up next
+## Unreleased
+
+## [0.51.0](https://github.com/returntocorp/semgrep/releases/tag/v0.51.0) - 2021-05-13
+
 ### Added
+- Keep track of and report rule parse time in addition to file parse time.
+- v0 of opt-in anonymous aggregate metrics.
+- Improved cheatsheet for generic mode, now recommending indented
+  patterns (#2911, #3028).
+
 ### Fixed
+
+- JS/TS: allow the deep expression operator <... ...> in expression
+statement position, for example:
+```
+$ARG = [$V];
+...
+<... $O[$ARG] ...>; // this works now
+```
+
+- PHP arrays with dots inside parse
+- Propagate constants in nested lvalues such as `y` in `x[y]`
+- C# experimental support
+
 ### Changed
+- Show log messages from semgrep-core when running semgrep with
+  `--debug`.
+- By default, targets larger than 1 MB are now excluded from semgrep
+  scans. New option `--max-target-bytes 0` restores the old behavior.
+- Report relative path instead of absolute when using `--time`
+
+## [0.50.1](https://github.com/returntocorp/semgrep/releases/tag/v0.50.1) - 2021-05-06
+
+### Changed
+- Reinstate `--debugging-json` to avoid stderr output of `--debug`
+
+## [0.50.0](https://github.com/returntocorp/semgrep/releases/tag/v0.50.0) - 2021-05-06
+
+### Added
+- JS/TS: Infer global constants even if the `const` qualifier is missing (#2978)
+- PHP: Resolve names and infer global constants in the same way as for Python
+
+### Fixed
+- Empty yaml files do not crash
+- Autofix does not insert newline characters for patterns from semgrep.live (#3045)
+- Autofix printout is grouped with its own finding rather than the one below it (#3046)
+- Do not assign constant values to assigned variables (#2805)
+- A `--time` flag instead of `--json-time` which shows a summary of the
+  timing information when invoked with normal output and adds a time field
+  to the json output when `--json` is also present
+
+### Changed
+- .git/ directories are ignored when scanning
+- External Python API (`semgrep_main.invoke_semgrep`) now takes an
+  optional `OutputSettings` argument for controlling output
+- `OutputSettings.json_time` has moved to `OutputSettings.output_time`,
+  this and many other `OutputSettings` arguments have been made optional
+
+### Removed
+- `--debugging-json` flag in favor of `--json` + `--debug`
+- `--json-time` flag in favor of `--json` + `--time`
 
 ## [0.49.0](https://github.com/returntocorp/semgrep/releases/tag/v0.49.0) - 2021-04-28
 

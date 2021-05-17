@@ -1,56 +1,38 @@
+import hashlib
 import json
 import logging
+import subprocess
+import time
 from io import StringIO
 from pathlib import Path
 from re import sub
 from typing import Any
+from typing import Dict
 from typing import List
 from typing import Optional
-from typing import Tuple
+from typing import Union
 
 import attr
 
-import semgrep.config_resolver
 from semgrep.autofix import apply_fixes
+from semgrep.config_resolver import get_config
 from semgrep.constants import COMMA_SEPARATED_LIST_RE
-from semgrep.constants import DEFAULT_CONFIG_FILE
 from semgrep.constants import DEFAULT_TIMEOUT
 from semgrep.constants import NOSEM_INLINE_RE
 from semgrep.constants import OutputFormat
 from semgrep.core_runner import CoreRunner
 from semgrep.error import MISSING_CONFIG_EXIT_CODE
 from semgrep.error import SemgrepError
+from semgrep.metric_manager import metric_manager
 from semgrep.output import OutputHandler
 from semgrep.output import OutputSettings
+from semgrep.profile_manager import ProfileManager
 from semgrep.rule import Rule
 from semgrep.rule_match import RuleMatch
 from semgrep.target_manager import TargetManager
+from semgrep.util import sub_check_output
 
 logger = logging.getLogger(__name__)
-
-
-def get_config(
-    pattern: str, lang: str, config_strs: List[str]
-) -> Tuple[semgrep.config_resolver.Config, List[SemgrepError]]:
-    # let's check for a pattern
-    if pattern:
-        # and a language
-        if not lang:
-            raise SemgrepError("language must be specified when a pattern is passed")
-
-        # TODO for now we generate a manual config. Might want to just call semgrep -e ... -l ...
-        config, errors = semgrep.config_resolver.Config.from_pattern_lang(pattern, lang)
-    else:
-        # else let's get a config. A config is a dict from config_id -> config. Config Id is not well defined at this point.
-        config, errors = semgrep.config_resolver.Config.from_config_list(config_strs)
-
-    # if we can't find a config, use default r2c rules
-    if not config:
-        raise SemgrepError(
-            f"No config given and {DEFAULT_CONFIG_FILE} was not found. Try running with --help to debug or if you want to download a default config, try running with --config r2c"
-        )
-
-    return config, errors
 
 
 def notify_user_of_work(
@@ -129,27 +111,22 @@ def rule_match_nosem(rule_match: RuleMatch, strict: bool) -> bool:
     return result
 
 
-def invoke_semgrep(config: Path, targets: List[Path], **kwargs: Any) -> Any:
+def invoke_semgrep(
+    config: Path,
+    targets: List[Path],
+    output_settings: Optional[OutputSettings] = None,
+    **kwargs: Any,
+) -> Union[Dict[str, Any], str]:
     """
-    Call semgrep with config on targets and return result as a json object
+    Return Semgrep results of 'config' on 'targets' as a dict|str
 
-    Uses default arguments of MAIN unless overwritten with a kwarg
+    Uses default arguments of 'semgrep_main.main' unless overwritten with 'kwargs'
     """
+    if output_settings is None:
+        output_settings = OutputSettings(output_format=OutputFormat.JSON)
+
     io_capture = StringIO()
-    output_handler = OutputHandler(
-        OutputSettings(
-            output_format=OutputFormat.JSON,
-            output_destination=None,
-            error_on_findings=False,
-            verbose_errors=False,
-            strict=False,
-            json_stats=False,
-            json_time=False,
-            output_per_finding_max_lines_limit=None,
-            output_per_line_max_chars_limit=None,
-        ),
-        stdout=io_capture,
-    )
+    output_handler = OutputHandler(output_settings, stdout=io_capture)
     main(
         output_handler=output_handler,
         target=[str(t) for t in targets],
@@ -159,7 +136,14 @@ def invoke_semgrep(config: Path, targets: List[Path], **kwargs: Any) -> Any:
         **kwargs,
     )
     output_handler.close()
-    return json.loads(io_capture.getvalue())
+
+    result: Union[Dict[str, Any], str] = (
+        json.loads(io_capture.getvalue())
+        if output_settings.output_format.is_json()
+        else io_capture.getvalue()
+    )
+
+    return result
 
 
 def main(
@@ -180,6 +164,7 @@ def main(
     no_git_ignore: bool = False,
     timeout: int = DEFAULT_TIMEOUT,
     max_memory: int = 0,
+    max_target_bytes: int = 0,
     timeout_threshold: int = 0,
     skip_unknown_extensions: bool = False,
     severity: Optional[List[str]] = None,
@@ -243,21 +228,25 @@ The two most popular are:
     target_manager = TargetManager(
         includes=include,
         excludes=exclude,
+        max_target_bytes=max_target_bytes,
         targets=target,
         respect_git_ignore=respect_git_ignore,
         output_handler=output_handler,
         skip_unknown_extensions=skip_unknown_extensions,
     )
 
+    profiler = ProfileManager()
+
+    start_time = time.time()
     # actually invoke semgrep
     (
         rule_matches_by_rule,
         debug_steps_by_rule,
         semgrep_errors,
         all_targets,
-        profiler,
-        match_time_matrix,
+        profiling_data,
     ) = CoreRunner(
+        output_settings=output_handler.settings,
         allow_exec=dangerously_allow_arbitrary_code_execution_from_rules,
         jobs=jobs,
         timeout=timeout,
@@ -265,8 +254,9 @@ The two most popular are:
         timeout_threshold=timeout_threshold,
         report_time=report_time,
     ).invoke_semgrep(
-        target_manager, filtered_rules, optimizations
+        target_manager, profiler, filtered_rules, optimizations
     )
+    profiler.save("total_time", start_time)
 
     output_handler.handle_semgrep_errors(semgrep_errors)
 
@@ -278,16 +268,44 @@ The two most popular are:
         for rule, rule_matches in rule_matches_by_rule.items()
     }
 
+    num_findings_nosem = 0
     if not disable_nosem:
-        rule_matches_by_rule = {
-            rule: [
-                rule_match for rule_match in rule_matches if not rule_match._is_ignored
-            ]
-            for rule, rule_matches in rule_matches_by_rule.items()
-        }
+        filtered_rule_matches_by_rule = {}
+        for rule, rule_matches in rule_matches_by_rule.items():
+            filtered_rule_matches = []
+            for rule_match in rule_matches:
+                if rule_match._is_ignored:
+                    num_findings_nosem += 1
+                else:
+                    filtered_rule_matches.append(rule_match)
+            filtered_rule_matches_by_rule[rule] = filtered_rule_matches
+        rule_matches_by_rule = filtered_rule_matches_by_rule
 
     num_findings = sum(len(v) for v in rule_matches_by_rule.values())
     stats_line = f"ran {len(filtered_rules)} rules on {len(all_targets)} files: {num_findings} findings"
+
+    project_hash = None
+    try:
+        project_url = sub_check_output(
+            ["git", "ls-remote", "--get-url"],
+            encoding="utf-8",
+            stderr=subprocess.DEVNULL,
+        )
+        project_hash = hashlib.sha256(project_url.encode()).hexdigest()
+    except Exception as e:
+        logger.debug(f"Failed to generate project hash: {e}")
+
+    metric_manager.set_project_hash(project_hash)
+    metric_manager.set_configs_hash(configs)
+    metric_manager.set_rules_hash(filtered_rules)
+    metric_manager.set_num_rules(len(filtered_rules))
+    metric_manager.set_num_targets(len(all_targets))
+    metric_manager.set_num_findings(num_findings)
+    metric_manager.set_num_ignored(num_findings_nosem)
+    metric_manager.set_run_time(profiler.calls["total_time"][0])
+    total_bytes_scanned = sum(t.stat().st_size for t in all_targets)
+    metric_manager.set_total_bytes_scanned(total_bytes_scanned)
+    metric_manager.set_errors(list(type(e).__name__ for e in semgrep_errors))
 
     output_handler.handle_semgrep_core_output(
         rule_matches_by_rule,
@@ -296,7 +314,7 @@ The two most popular are:
         all_targets,
         profiler,
         filtered_rules,
-        match_time_matrix,
+        profiling_data,
     )
 
     if autofix:
